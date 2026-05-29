@@ -34,16 +34,6 @@ export function InputBar({ onSubmit, disabled = false }: InputBarProps) {
     scrollRef,
   } = useCommandMenu();
 
-  const handleCommandExecute = useCallback(
-    (index: number) => {
-      const command = resolveCommand(index);
-      if (command) {
-        handleCommand(command);
-      }
-    },
-    [resolveCommand],
-  );
-
   const handleTextareaContentChange = useCallback(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
@@ -80,6 +70,16 @@ export function InputBar({ onSubmit, disabled = false }: InputBarProps) {
       }
     },
     [renderer],
+  );
+
+  const handleCommandExecute = useCallback(
+    (index: number) => {
+      const command = resolveCommand(index);
+      if (command) {
+        handleCommand(command);
+      }
+    },
+    [resolveCommand, handleCommand],
   );
 
   // Wire up textarea submit handler once so it always reads the latest state.
