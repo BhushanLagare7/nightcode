@@ -1,0 +1,17 @@
+{
+  "name": "nightcode",
+  "version": "1.0.0",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:cli": "bun run --watch packages/cli/src/index.tsx",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
+  "devDependencies": {
+    "eslint": "^10.4.0",
+    "eslint-plugin-react": "^7.37.5",
+    "typescript-eslint": "^8.60.0"
+  }
+}
