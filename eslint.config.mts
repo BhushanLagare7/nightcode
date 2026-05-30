@@ -1,6 +1,8 @@
 import reactPlugin from "eslint-plugin-react";
 import tseslint from "typescript-eslint";
 
+import type { Linter } from "eslint";
+
 export default [
   {
     name: "custom/jsx-sort-props",
@@ -29,4 +31,4 @@ export default [
       ],
     },
   },
-];
+] satisfies Linter.Config[];

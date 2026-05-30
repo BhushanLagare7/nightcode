@@ -1,3 +1,20 @@
 {
-  "cSpell.words": ["Renderable", "scrollbox"]
+  "cSpell.words": [
+    "Catppuccin",
+    "Everforest",
+    "Kanagawa",
+    "Monokai",
+    "Nightfox",
+    "Nord",
+    "Palenight",
+    "Poimandres",
+    "Renderable",
+    "Rosé",
+    "scrollbox",
+    "Synthwave",
+    "Vitesse"
+  ],
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  }
 }

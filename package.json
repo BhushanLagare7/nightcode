@@ -12,6 +12,7 @@
   "devDependencies": {
     "eslint": "^10.4.0",
     "eslint-plugin-react": "^7.37.5",
+    "jiti": "^2.7.0",
     "typescript-eslint": "^8.60.0"
   }
 }
