@@ -2,12 +2,18 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { Header } from "./components/headers";
 import { InputBar } from "./components/input-bar";
+import { DialogProvider } from "./providers/dialog";
+import { KeyboardLayerProvider } from "./providers/keyboard-layer";
+import { ThemeProvider, useTheme } from "./providers/theme";
+import { ToastProvider } from "./providers/toast";
 
-function App() {
+function ThemedRoot() {
+  const { colors } = useTheme();
+
   return (
     <box
       alignItems="center"
-      backgroundColor="#0D0D12"
+      backgroundColor={colors.background}
       gap={2}
       height="100%"
       justifyContent="center"
@@ -18,6 +24,20 @@ function App() {
         <InputBar disabled={false} onSubmit={() => {}} />
       </box>
     </box>
+  );
+}
+
+function App() {
+  return (
+    <ThemeProvider>
+      <KeyboardLayerProvider>
+        <DialogProvider>
+          <ToastProvider>
+            <ThemedRoot />
+          </ToastProvider>
+        </DialogProvider>
+      </KeyboardLayerProvider>
+    </ThemeProvider>
   );
 }
 
