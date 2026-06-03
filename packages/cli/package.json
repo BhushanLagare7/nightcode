@@ -7,6 +7,7 @@
     "dev": "bun run --watch src/index.tsx"
   },
   "devDependencies": {
+    "@nightcode/server": "workspace:*",
     "@types/bun": "latest",
     "@types/react": "^19.2.15"
   },
@@ -14,10 +15,13 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@nightcode/shared": "workspace:*",
     "@opentui/core": "^0.2.16",
     "@opentui/react": "^0.2.16",
+    "hono": "^4.12.23",
     "opentui-spinner": "^0.0.6",
     "react": "^19.2.6",
-    "react-router": "^7.16.0"
+    "react-router": "^7.16.0",
+    "zod": "^4.4.3"
   }
 }
