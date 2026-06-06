@@ -8,6 +8,7 @@ type SessionShellProps = {
   onSubmit: (text: string) => void;
   inputDisabled?: boolean;
   loading?: boolean;
+  interruptible?: boolean;
 };
 
 export function SessionShell({
@@ -15,6 +16,7 @@ export function SessionShell({
   onSubmit,
   inputDisabled = false,
   loading = false,
+  interruptible = false,
 }: SessionShellProps) {
   return (
     <box
@@ -42,7 +44,12 @@ export function SessionShell({
         width="100%"
       >
         <box alignItems="center" flexDirection="row" gap={2}>
-          {loading ? <Spinner /> : null}
+          {loading ? (
+            <>
+              <Spinner />
+              {interruptible ? <text>esc to interrupt</text> : null}
+            </>
+          ) : null}
         </box>
         <box flexDirection="row" flexShrink={0} gap={1} marginLeft="auto">
           <text>tab</text>
