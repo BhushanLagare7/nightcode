@@ -1,18 +1,20 @@
+import { Mode } from "@nightcode/database/enums";
 import { useTheme } from "../../providers/theme";
 import { EmptyBorder } from "../border";
 
 type UserMessageProps = {
   message: string;
+  mode: Mode;
 };
 
-export function UserMessage({ message }: UserMessageProps) {
+export function UserMessage({ message, mode }: UserMessageProps) {
   const { colors } = useTheme();
 
   return (
     <box alignItems="center" width="100%">
       <box
         border={["left"]}
-        borderColor={colors.primary}
+        borderColor={mode === Mode.PLAN ? colors.planMode : colors.primary}
         customBorderChars={{
           ...EmptyBorder,
           vertical: "┃",
