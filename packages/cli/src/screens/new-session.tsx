@@ -1,4 +1,4 @@
-import { DEFAULT_CHAT_MODEL_ID } from "@nightcode/shared";
+import { Mode } from "@nightcode/database/enums";
 import { useEffect, useMemo, useRef } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { z } from "zod";
@@ -10,6 +10,8 @@ import { useToast } from "../providers/toast";
 
 const newSessionStateSchema = z.object({
   message: z.string(),
+  mode: z.enum(Mode),
+  model: z.string(),
 });
 
 export function NewSession() {
@@ -45,10 +47,10 @@ export function NewSession() {
             title: state.message.slice(0, 100),
             cwd: process.cwd(),
             initialMessage: {
-              role: "USER",
               content: state.message,
-              model: DEFAULT_CHAT_MODEL_ID,
-              mode: "BUILD",
+              mode: state.mode,
+              model: state.model,
+              role: "USER",
             },
           },
         });
@@ -85,7 +87,7 @@ export function NewSession() {
 
   return (
     <SessionShell inputDisabled loading onSubmit={() => {}}>
-      <UserMessage message={state.message} />
+      <UserMessage message={state.message} mode={state.mode} />
     </SessionShell>
   );
 }
