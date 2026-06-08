@@ -1,4 +1,6 @@
 import { SUPPORTED_CHAT_MODELS } from "@nightcode/shared";
+import { clearAuth } from "../../lib/auth";
+import { performLogin } from "../../lib/oauth";
 import {
   AgentsDialogContent,
   ModelsDialogContent,
@@ -74,10 +76,20 @@ export const COMMANDS: Command[] = [
     name: "login",
     description: "Sign in with your browser",
     value: "/login",
-    action: (ctx) => {
-      ctx.toast.show({
-        message: "Opening browser to sign in...",
-      });
+    action: async (ctx) => {
+      ctx.toast.show({ message: "Opening browser to sign in..." });
+
+      try {
+        await performLogin();
+        ctx.toast.show({ variant: "success", message: "Signed in" });
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Sign in failed or timed out";
+
+        ctx.toast.show({ variant: "error", message });
+      }
     },
   },
   {
@@ -85,10 +97,8 @@ export const COMMANDS: Command[] = [
     description: "Sign out of your account",
     value: "/logout",
     action: (ctx) => {
-      ctx.toast.show({
-        message: "Signed out",
-        variant: "success",
-      });
+      clearAuth();
+      ctx.toast.show({ variant: "success", message: "Signed out" });
     },
   },
   {

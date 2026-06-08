@@ -1,3 +1,8 @@
+/**
+ * Session routes — handles CRUD operations for chat sessions.
+ * All routes require an authenticated user (via AuthenticatedEnv).
+ */
+
 import { zValidator } from "@hono/zod-validator";
 import { db } from "@nightcode/database/client";
 import { MessageStatus, Mode, Role } from "@nightcode/database/enums";
@@ -6,15 +11,19 @@ import * as Sentry from "@sentry/hono/bun";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
+import type { AuthenticatedEnv } from "../middleware/require-auth";
 
+/** Shape of the request body for creating a new session. */
 const createSessionSchema = z.object({
   title: z.string(),
   cwd: z.string().optional(),
+  /** If provided, this message is created together with the session. */
   initialMessage: z
     .object({
       role: z.enum(Role),
       content: z.string(),
       mode: z.enum(Mode),
+      /** Must be a model ID supported by findSupportedChatModel. */
       model: z
         .string()
         .refine((id) => !!findSupportedChatModel(id), "Unsupported model"),
@@ -22,6 +31,10 @@ const createSessionSchema = z.object({
     .optional(),
 });
 
+/**
+ * Zod validator middleware for POST /sessions.
+ * Returns 400 and logs a Sentry warning when validation fails.
+ */
 const createSessionValidator = zValidator(
   "json",
   createSessionSchema,
@@ -47,8 +60,14 @@ const createSessionValidator = zValidator(
   },
 );
 
-const app = new Hono()
+const app = new Hono<AuthenticatedEnv>()
+  /**
+   * GET /
+   * Returns all sessions for the authenticated user, ordered newest first.
+   */
   .get("/", async (c) => {
+    const userId = c.get("userId");
+
     Sentry.addBreadcrumb({
       category: "db",
       message: "Querying all sessions",
@@ -57,6 +76,7 @@ const app = new Hono()
 
     try {
       const sessions = await db.session.findMany({
+        where: { userId },
         orderBy: { createdAt: "desc" },
         select: {
           id: true,
@@ -81,8 +101,14 @@ const app = new Hono()
       throw new HTTPException(500, { message: "Failed to load sessions" });
     }
   })
+  /**
+   * GET /:id
+   * Returns a single session with its messages, ordered oldest first.
+   * Responds with 404 if the session doesn't exist or belongs to another user.
+   */
   .get("/:id", async (c) => {
     const id = c.req.param("id");
+    const userId = c.get("userId");
 
     Sentry.setTag("session.id", id);
     Sentry.addBreadcrumb({
@@ -93,7 +119,7 @@ const app = new Hono()
 
     try {
       const session = await db.session.findUnique({
-        where: { id },
+        where: { id, userId },
         include: {
           messages: {
             orderBy: { createdAt: "asc" },
@@ -131,8 +157,15 @@ const app = new Hono()
       throw new HTTPException(500, { message: "Failed to load session" });
     }
   })
+  /**
+   * POST /
+   * Creates a new session for the authenticated user.
+   * If initialMessage is provided, it is persisted with status COMPLETE
+   * in the same database transaction. Responds with 201 on success.
+   */
   .post("/", createSessionValidator, async (c) => {
     const { initialMessage, ...data } = c.req.valid("json");
+    const userId = c.get("userId");
 
     Sentry.addBreadcrumb({
       category: "db",
@@ -145,7 +178,7 @@ const app = new Hono()
       const session = await db.session.create({
         data: {
           ...data,
-          userId: "mock-user",
+          userId,
           ...(initialMessage && {
             messages: {
               create: {
@@ -183,4 +216,3 @@ const app = new Hono()
   });
 
 export default app;
-
