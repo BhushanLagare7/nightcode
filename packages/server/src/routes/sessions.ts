@@ -6,27 +6,26 @@
 import { zValidator } from "@hono/zod-validator";
 import { db } from "@nightcode/database/client";
 import { MessageStatus, Mode, Role } from "@nightcode/database/enums";
-import { findSupportedChatModel } from "@nightcode/shared";
 import * as Sentry from "@sentry/hono/bun";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
+import { isSupportedChatModel } from "../lib/models";
 import type { AuthenticatedEnv } from "../middleware/require-auth";
+import { requireCreditsBalance } from "../middleware/require-credits-balance";
 
 /** Shape of the request body for creating a new session. */
 const createSessionSchema = z.object({
   title: z.string(),
-  cwd: z.string().optional(),
+  cwd: z.string().optional(), // Current working directory context
   /** If provided, this message is created together with the session. */
   initialMessage: z
     .object({
       role: z.enum(Role),
       content: z.string(),
       mode: z.enum(Mode),
-      /** Must be a model ID supported by findSupportedChatModel. */
-      model: z
-        .string()
-        .refine((id) => !!findSupportedChatModel(id), "Unsupported model"),
+      /** Must be a model ID supported by isSupportedChatModel. */
+      model: z.string().refine(isSupportedChatModel, "Unsupported model"),
     })
     .optional(),
 });
@@ -40,6 +39,7 @@ const createSessionValidator = zValidator(
   createSessionSchema,
   (result, c) => {
     if (!result.success) {
+      // Log validation failures for telemetry
       Sentry.logger.warn("Session creation validation failed", {
         path: c.req.path,
         issues: result.error.issues.length,
@@ -60,13 +60,14 @@ const createSessionValidator = zValidator(
   },
 );
 
+// Initialize Hono app bound to the authenticated environment context
 const app = new Hono<AuthenticatedEnv>()
   /**
    * GET /
    * Returns all sessions for the authenticated user, ordered newest first.
    */
   .get("/", async (c) => {
-    const userId = c.get("userId");
+    const userId = c.get("userId"); // Extract authenticated user
 
     Sentry.addBreadcrumb({
       category: "db",
@@ -75,6 +76,7 @@ const app = new Hono<AuthenticatedEnv>()
     });
 
     try {
+      // Fetch session metadata list from DB
       const sessions = await db.session.findMany({
         where: { userId },
         orderBy: { createdAt: "desc" },
@@ -91,6 +93,7 @@ const app = new Hono<AuthenticatedEnv>()
 
       return c.json(sessions);
     } catch (error) {
+      // Standardized DB error capture
       Sentry.captureException(error, {
         tags: { "error.type": "database", "db.operation": "session.findMany" },
       });
@@ -118,6 +121,7 @@ const app = new Hono<AuthenticatedEnv>()
     });
 
     try {
+      // Fetch unique session while ensuring it belongs to the active user
       const session = await db.session.findUnique({
         where: { id, userId },
         include: {
@@ -163,7 +167,7 @@ const app = new Hono<AuthenticatedEnv>()
    * If initialMessage is provided, it is persisted with status COMPLETE
    * in the same database transaction. Responds with 201 on success.
    */
-  .post("/", createSessionValidator, async (c) => {
+  .post("/", requireCreditsBalance, createSessionValidator, async (c) => {
     const { initialMessage, ...data } = c.req.valid("json");
     const userId = c.get("userId");
 
@@ -175,6 +179,7 @@ const app = new Hono<AuthenticatedEnv>()
     });
 
     try {
+      // Create session, and optionally nest-create the first message in one transaction
       const session = await db.session.create({
         data: {
           ...data,
