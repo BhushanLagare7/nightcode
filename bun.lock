@@ -4,6 +4,9 @@
   "workspaces": {
     "": {
       "name": "nightcode",
+      "dependencies": {
+        "dotenv": "^17.4.2",
+      },
       "devDependencies": {
         "eslint": "^9.7.0",
         "eslint-plugin-react": "^7.37.5",
