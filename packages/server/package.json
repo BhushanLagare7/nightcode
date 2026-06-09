@@ -19,6 +19,7 @@
     "@hono/zod-validator": "^0.8.0",
     "@nightcode/database": "workspace:*",
     "@nightcode/shared": "workspace:*",
+    "@polar-sh/sdk": "^0.48.1",
     "@sentry/bun": "^10.56.0",
     "@sentry/hono": "^10.56.0",
     "ai": "^6.0.196",

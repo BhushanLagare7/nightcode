@@ -9,12 +9,19 @@ import {
   type MessagePart,
 } from "@nightcode/shared";
 import * as Sentry from "@sentry/hono/bun";
-import { streamText as aiStreamText, stepCountIs } from "ai";
+import {
+  streamText as aiStreamText,
+  stepCountIs,
+  type LanguageModelUsage,
+} from "ai";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
+import { calculateCreditsForUsage } from "../lib/credits";
 import { isSupportedChatModel, resolveChatModel } from "../lib/models";
+import { ingestAiUsage } from "../lib/polar";
 import type { AuthenticatedEnv } from "../middleware/require-auth";
+import { requireCreditsBalance } from "../middleware/require-credits-balance";
 import { buildSystemPrompt } from "../system-prompt";
 import { createTools } from "../tools";
 
@@ -103,12 +110,19 @@ function getResumableUserMessage(
 /** Parameters required to initiate an AI streaming response. */
 type StreamParams = {
   sessionId: string;
+  userId: string;
   model: string;
   /** Working directory for tool execution; null disables tools. */
   cwd: string | null;
   history: { role: "user" | "assistant"; content: string }[];
   mode: Mode;
   abortController: AbortController;
+};
+
+/** Parameters required to bill and record usage for a completed message. */
+type IngestUsageForMessageParams = {
+  messageId: string;
+  status: "complete" | "interrupted";
 };
 
 /**
@@ -125,11 +139,13 @@ async function streamAIResponse(
   stream: Parameters<Parameters<typeof streamSSE>[1]>[0],
   params: StreamParams,
 ) {
-  const { sessionId, model, cwd, history, mode, abortController } = params;
+  const { sessionId, userId, model, cwd, history, mode, abortController } =
+    params;
   const startTime = Date.now();
   const tools = cwd ? createTools(cwd, mode) : undefined;
   const parts: MessagePart[] = [];
   const resolvedModel = resolveChatModel(model);
+  let completedUsage: LanguageModelUsage | null = null;
 
   Sentry.setTag("chat.session_id", sessionId);
   Sentry.setTag("chat.model", model);
@@ -153,6 +169,7 @@ async function streamAIResponse(
       .map((p) => p.text)
       .join("");
 
+    // Nothing to persist if no content was received before the abort.
     if (fullText.length === 0 && parts.length === 0) return;
 
     const elapsedMs = Date.now() - startTime;
@@ -172,7 +189,7 @@ async function streamAIResponse(
       data: { sessionId, elapsedMs, textLength: fullText.length },
     });
 
-    await db.message.create({
+    return db.message.create({
       data: {
         content: fullText,
         duration: Math.round(elapsedMs / 1000),
@@ -186,6 +203,52 @@ async function streamAIResponse(
     });
   };
 
+  /** Calculates credit cost and forwards usage to Polar for billing. */
+  const ingestUsageForMessage = async ({
+    messageId,
+    status,
+  }: IngestUsageForMessageParams) => {
+    // Usage is only available after onFinish fires; skip if stream never completed a step.
+    if (!completedUsage) return;
+
+    try {
+      const billableUsage = calculateCreditsForUsage({
+        model: resolvedModel.modelId,
+        provider: resolvedModel.provider,
+        usage: completedUsage,
+      });
+
+      await ingestAiUsage({
+        eventId: `chat-message:${messageId}`,
+        externalCustomerId: userId,
+        credits: billableUsage.credits,
+      });
+    } catch (error) {
+      // Billing failures are non-fatal; log and continue so the user is not blocked.
+      Sentry.captureException(error, {
+        tags: { "error.type": "usage_ingestion_failed" },
+        extra: { messageId, sessionId, userId },
+      });
+      Sentry.logger.error("Failed to ingest Polar AI usage for chat message", {
+        message: error instanceof Error ? error.message : String(error),
+        messageId,
+        sessionId,
+        userId,
+      });
+    }
+  };
+
+  /** Persists an interrupted message then records its usage, in order. */
+  const persistInterruptedMessageAndUsage = async () => {
+    const interruptedMessage = await persistInterruptedMessage();
+    if (!interruptedMessage) return;
+
+    await ingestUsageForMessage({
+      messageId: interruptedMessage.id,
+      status: "interrupted",
+    });
+  };
+
   try {
     const result = aiStreamText({
       abortSignal: abortController.signal,
@@ -196,12 +259,18 @@ async function streamAIResponse(
       stopWhen: tools ? stepCountIs(50) : undefined,
       system: buildSystemPrompt({ cwd, mode }),
       tools,
+      onFinish(event) {
+        // Capture total token usage so it can be billed after the stream ends.
+        completedUsage = event.totalUsage;
+      },
     });
 
     for await (const part of result.fullStream) {
+      // Stop processing if the client disconnected mid-stream.
       if (stream.aborted) break;
 
       if (part.type === "reasoning-delta") {
+        // Merge consecutive reasoning deltas into a single part.
         const last = parts[parts.length - 1];
         if (last && last.type === "reasoning") {
           last.text += part.text;
@@ -219,6 +288,7 @@ async function streamAIResponse(
       }
 
       if (part.type === "text-delta") {
+        // Merge consecutive text deltas into a single part.
         const last = parts[parts.length - 1];
         if (last && last.type === "text") {
           last.text += part.text;
@@ -305,8 +375,9 @@ async function streamAIResponse(
       }
     }
 
+    // Handle mid-stream aborts that broke out of the for-await loop above.
     if (stream.aborted || abortController.signal.aborted) {
-      await persistInterruptedMessage();
+      await persistInterruptedMessageAndUsage();
       return;
     }
 
@@ -337,6 +408,11 @@ async function streamAIResponse(
       durationMs: elapsedMs,
     });
 
+    await ingestUsageForMessage({
+      messageId: assistantMessage.id,
+      status: "complete",
+    });
+
     const doneEvent: ChatStreamEvent = {
       type: "done",
       messageId: assistantMessage.id,
@@ -345,13 +421,14 @@ async function streamAIResponse(
 
     await stream.writeSSE({ event: "done", data: JSON.stringify(doneEvent) });
   } catch (error) {
+    // A caught abort means the client disconnected; persist what we have and exit cleanly.
     if (abortController.signal.aborted) {
       Sentry.addBreadcrumb({
         category: "chat",
         message: "AI response aborted by signal during stream",
         level: "info",
       });
-      await persistInterruptedMessage();
+      await persistInterruptedMessageAndUsage();
       return;
     }
 
@@ -465,6 +542,7 @@ const app = new Hono<AuthenticatedEnv>()
               mode: resumableMessage.mode,
               model: resumableMessage.model,
               sessionId,
+              userId,
             });
           } finally {
             // Always release the lock so a future resume can proceed.
@@ -472,6 +550,7 @@ const app = new Hono<AuthenticatedEnv>()
           }
         },
         async (err, stream) => {
+          // SSE-level error handler: fires when the stream itself throws unexpectedly.
           activeResumeSessionIds.delete(sessionId);
           Sentry.captureException(err, {
             tags: {
@@ -497,6 +576,7 @@ const app = new Hono<AuthenticatedEnv>()
         },
       );
     } catch (error) {
+      // Catches synchronous throws from streamSSE setup itself.
       activeResumeSessionIds.delete(sessionId);
       Sentry.captureException(error, {
         tags: { "error.type": "resume_route_failed" },
@@ -515,7 +595,7 @@ const app = new Hono<AuthenticatedEnv>()
    * Accepts a new user message, persists it, then streams the AI
    * response back over SSE. Validated by `submitValidator`.
    */
-  .post("/:sessionId", submitValidator, async (c) => {
+  .post("/:sessionId", requireCreditsBalance, submitValidator, async (c) => {
     const sessionId = c.req.param("sessionId");
     const userId = c.get("userId");
 
@@ -582,9 +662,11 @@ const app = new Hono<AuthenticatedEnv>()
             mode: data.mode,
             model: data.model,
             sessionId,
+            userId,
           });
         },
         async (err, stream) => {
+          // SSE-level error handler: fires when the stream itself throws unexpectedly.
           Sentry.captureException(err, {
             tags: {
               "error.type": "sse_stream_error",
@@ -609,6 +691,7 @@ const app = new Hono<AuthenticatedEnv>()
         },
       );
     } catch (error) {
+      // Catches synchronous throws from streamSSE setup itself.
       Sentry.captureException(error, {
         tags: { "error.type": "submit_route_failed" },
         extra: { sessionId },

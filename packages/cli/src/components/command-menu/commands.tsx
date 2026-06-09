@@ -1,6 +1,7 @@
 import { SUPPORTED_CHAT_MODELS } from "@nightcode/shared";
 import { clearAuth } from "../../lib/auth";
 import { performLogin } from "../../lib/oauth";
+import { openBillingPortal, openUpgradeCheckout } from "../../lib/upgrade";
 import {
   AgentsDialogContent,
   ModelsDialogContent,
@@ -105,20 +106,42 @@ export const COMMANDS: Command[] = [
     name: "upgrade",
     description: "Buy more credits",
     value: "/upgrade",
-    action: (ctx) => {
-      ctx.toast.show({
-        message: "Opening credits checkout...",
-      });
+    action: async (ctx) => {
+      ctx.toast.show({ message: "Opening credits checkout..." });
+
+      try {
+        await openUpgradeCheckout();
+        ctx.toast.show({
+          variant: "success",
+          message: "Checkout opened in browser",
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Failed to open checkout";
+        ctx.toast.show({ variant: "error", message });
+      }
     },
   },
   {
     name: "usage",
     description: "Open billing portal in your browser",
     value: "/usage",
-    action: (ctx) => {
-      ctx.toast.show({
-        message: "Opening billing portal...",
-      });
+    action: async (ctx) => {
+      ctx.toast.show({ message: "Opening billing portal..." });
+
+      try {
+        await openBillingPortal();
+        ctx.toast.show({
+          variant: "success",
+          message: "Billing portal opened in browser",
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Failed to open billing portal";
+        ctx.toast.show({ variant: "error", message });
+      }
     },
   },
   {
