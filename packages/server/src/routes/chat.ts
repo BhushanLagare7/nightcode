@@ -1,21 +1,21 @@
 import { zValidator } from "@hono/zod-validator";
 import type { Prisma } from "@nightcode/database";
 import { db } from "@nightcode/database/client";
-import { MessageStatus, Mode } from "@nightcode/database/enums";
 import {
-  messagePartsSchema,
-  toolCallArgsSchema,
-  type ChatStreamEvent,
-  type MessagePart,
+  getToolContracts,
+  modeSchema,
+  type ModeType,
+  type ToolContracts,
 } from "@nightcode/shared";
-import * as Sentry from "@sentry/hono/bun";
 import {
-  streamText as aiStreamText,
-  stepCountIs,
+  convertToModelMessages,
+  streamText,
+  validateUIMessages,
+  type InferUITools,
   type LanguageModelUsage,
+  type UIMessage,
 } from "ai";
 import { Hono } from "hono";
-import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import { calculateCreditsForUsage } from "../lib/credits";
 import { isSupportedChatModel, resolveChatModel } from "../lib/models";
@@ -23,685 +23,204 @@ import { ingestAiUsage } from "../lib/polar";
 import type { AuthenticatedEnv } from "../middleware/require-auth";
 import { requireCreditsBalance } from "../middleware/require-credits-balance";
 import { buildSystemPrompt } from "../system-prompt";
-import { createTools } from "../tools";
 
-/** Validates the shape of a new chat submission request body. */
+/** Metadata attached to each chat message, populated progressively during streaming. */
+type ChatMessageMetadata = {
+  mode?: ModeType;
+  model?: string;
+  /** Total time taken to generate the response in milliseconds. */
+  durationMs?: number;
+  usage?: LanguageModelUsage;
+};
+
+/** Extended UI message type that carries Nightcode-specific metadata and tool contracts. */
+type NightcodeUIMessage = UIMessage<
+  ChatMessageMetadata,
+  never,
+  InferUITools<ToolContracts>
+>;
+
+/** Expected shape of the chat submission request body. */
 const submitSchema = z.object({
-  content: z.string(),
-  mode: z.enum(Mode),
+  /** The session ID to associate the messages with. */
+  id: z.string(),
+  messages: z
+    .array(
+      z.custom<NightcodeUIMessage>((value) => {
+        // Ensure each message has the minimum required fields
+        return (
+          value != null &&
+          typeof value === "object" &&
+          "id" in value &&
+          "parts" in value
+        );
+      }),
+    )
+    .min(1),
+  mode: modeSchema,
   model: z.string().refine(isSupportedChatModel, "Unsupported model"),
 });
 
-/**
- * Zod validator middleware for chat submission.
- * Logs a warning and returns 400 when validation fails.
- */
+/** Validates the request JSON body against `submitSchema`, returning a 400 on failure. */
 const submitValidator = zValidator("json", submitSchema, (result, c) => {
   if (!result.success) {
-    Sentry.logger.warn("Chat submission validation failed", {
-      path: c.req.path,
-      issues: result.error.issues.length,
-    });
-
-    Sentry.addBreadcrumb({
-      category: "validation",
-      message: "Chat submission payload rejected",
-      level: "warning",
-      data: {
-        issueCount: result.error.issues.length,
-        fields: result.error.issues.map((i) => i.path.join(".")).join(", "),
-      },
-    });
-
     return c.json({ error: "Invalid request body" }, 400);
   }
 });
 
 /**
- * Tracks session IDs that currently have an active resume stream,
- * preventing duplicate concurrent resumes for the same session.
+ * Returns true if the message contains any tool call parts that have not
+ * yet received a result. Used to defer session persistence until all tool
+ * calls are resolved.
  */
-const activeResumeSessionIds = new Set<string>();
-
-/**
- * Converts raw DB messages into the format expected by the AI SDK.
- * Filters out ERROR role messages and empty ASSISTANT messages.
- */
-function buildConversationHistory(
-  messages: {
-    role: "USER" | "ASSISTANT" | "ERROR";
-    content: string;
-    status: MessageStatus;
-  }[],
-) {
-  return messages.flatMap((m) => {
-    if (m.role === "ERROR") return [];
-    if (m.role === "ASSISTANT" && m.content.length === 0) return [];
-
-    return [
-      {
-        role: m.role === "USER" ? ("user" as const) : ("assistant" as const),
-        content: m.content,
-      },
-    ];
-  });
-}
-
-/**
- * Returns the last message in the session if it is a USER message,
- * indicating the session has a pending request that can be resumed.
- * Returns null if the session is not in a resumable state.
- */
-function getResumableUserMessage(
-  messages: {
-    role: "USER" | "ASSISTANT" | "ERROR";
-    model: string;
-    mode: Mode;
-  }[],
-) {
-  const lastMessage = messages[messages.length - 1];
-  if (!lastMessage || lastMessage.role !== "USER") {
-    return null;
-  }
-
-  return lastMessage;
-}
-
-/** Parameters required to initiate an AI streaming response. */
-type StreamParams = {
-  sessionId: string;
-  userId: string;
-  model: string;
-  /** Working directory for tool execution; null disables tools. */
-  cwd: string | null;
-  history: { role: "user" | "assistant"; content: string }[];
-  mode: Mode;
-  abortController: AbortController;
-};
-
-/** Parameters required to bill and record usage for a completed message. */
-type IngestUsageForMessageParams = {
-  messageId: string;
-  status: "complete" | "interrupted";
-};
-
-/**
- * Streams an AI response over an SSE connection, handling the full
- * lifecycle of a chat turn:
- *
- * - Emits `reasoning-delta`, `text-delta`, `tool-call`, and
- *   `tool-result` events incrementally as the model produces them.
- * - Persists the completed assistant message to the database on success.
- * - Persists an INTERRUPTED message when the stream is aborted mid-flight.
- * - Persists an ERROR message and emits an error event on failure.
- */
-async function streamAIResponse(
-  stream: Parameters<Parameters<typeof streamSSE>[1]>[0],
-  params: StreamParams,
-) {
-  const { sessionId, userId, model, cwd, history, mode, abortController } =
-    params;
-  const startTime = Date.now();
-  const tools = cwd ? createTools(cwd, mode) : undefined;
-  const parts: MessagePart[] = [];
-  const resolvedModel = resolveChatModel(model);
-  let completedUsage: LanguageModelUsage | null = null;
-
-  Sentry.setTag("chat.session_id", sessionId);
-  Sentry.setTag("chat.model", model);
-  Sentry.setTag("chat.mode", mode);
-
-  Sentry.addBreadcrumb({
-    category: "chat",
-    message: "Starting AI streaming response",
-    level: "info",
-    data: { sessionId, model, mode, hasTools: !!tools },
-  });
-
-  /**
-   * Saves whatever partial content has been accumulated so far as an
-   * INTERRUPTED message. Called when the stream is aborted before
-   * completing, so the turn is not silently lost.
-   */
-  const persistInterruptedMessage = async () => {
-    const fullText = parts
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join("");
-
-    // Nothing to persist if no content was received before the abort.
-    if (fullText.length === 0 && parts.length === 0) return;
-
-    const elapsedMs = Date.now() - startTime;
-
-    const validatedParts: Prisma.InputJsonValue | undefined =
-      parts.length > 0 ? messagePartsSchema.parse(parts) : undefined;
-
-    Sentry.logger.info("Persisted interrupted message", {
-      sessionId,
-      elapsedMs,
-    });
-
-    Sentry.addBreadcrumb({
-      category: "chat",
-      message: "Message streaming interrupted",
-      level: "warning",
-      data: { sessionId, elapsedMs, textLength: fullText.length },
-    });
-
-    return db.message.create({
-      data: {
-        content: fullText,
-        duration: Math.round(elapsedMs / 1000),
-        mode,
-        model,
-        parts: validatedParts,
-        role: "ASSISTANT",
-        sessionId,
-        status: MessageStatus.INTERRUPTED,
-      },
-    });
-  };
-
-  /** Calculates credit cost and forwards usage to Polar for billing. */
-  const ingestUsageForMessage = async ({
-    messageId,
-    status,
-  }: IngestUsageForMessageParams) => {
-    // Usage is only available after onFinish fires; skip if stream never completed a step.
-    if (!completedUsage) return;
-
-    try {
-      const billableUsage = calculateCreditsForUsage({
-        model: resolvedModel.modelId,
-        provider: resolvedModel.provider,
-        usage: completedUsage,
-      });
-
-      await ingestAiUsage({
-        eventId: `chat-message:${messageId}`,
-        externalCustomerId: userId,
-        credits: billableUsage.credits,
-      });
-    } catch (error) {
-      // Billing failures are non-fatal; log and continue so the user is not blocked.
-      Sentry.captureException(error, {
-        tags: { "error.type": "usage_ingestion_failed" },
-        extra: { messageId, sessionId, userId },
-      });
-      Sentry.logger.error("Failed to ingest Polar AI usage for chat message", {
-        message: error instanceof Error ? error.message : String(error),
-        messageId,
-        sessionId,
-        userId,
-      });
+function hasPendingToolCalls(message: NightcodeUIMessage) {
+  return message.parts.some((part) => {
+    if (part.type === "dynamic-tool" || part.type.startsWith("tool-")) {
+      const state = (part as { state?: string }).state;
+      return state !== "output-available" && state !== "output-error";
     }
-  };
 
-  /** Persists an interrupted message then records its usage, in order. */
-  const persistInterruptedMessageAndUsage = async () => {
-    const interruptedMessage = await persistInterruptedMessage();
-    if (!interruptedMessage) return;
+    return false;
+  });
+}
 
-    await ingestUsageForMessage({
-      messageId: interruptedMessage.id,
-      status: "interrupted",
+/**
+ * POST /
+ *
+ * Accepts a chat submission, streams the AI response back to the client,
+ * and — once the stream is complete — persists the updated message history
+ * and reports token usage for billing.
+ *
+ * Middleware applied (in order):
+ *  1. `requireCreditsBalance` – rejects the request when the user has no credits.
+ *  2. `submitValidator`       – validates and parses the JSON request body.
+ */
+const app = new Hono<AuthenticatedEnv>().post(
+  "/",
+  requireCreditsBalance,
+  submitValidator,
+  async (c) => {
+    const userId = c.get("userId");
+    const { id, messages, mode, model } = c.req.valid("json");
+
+    // Verify the session belongs to the authenticated user
+    const session = await db.session.findUnique({
+      where: { id, userId },
     });
-  };
 
-  try {
-    const result = aiStreamText({
-      abortSignal: abortController.signal,
-      messages: history,
-      model: resolvedModel.model,
-      providerOptions: resolvedModel.providerOptions,
-      // Cap agentic loops at 50 steps when tools are available.
-      stopWhen: tools ? stepCountIs(50) : undefined,
-      system: buildSystemPrompt({ cwd, mode }),
+    if (!session) {
+      return c.json({ error: "Session not found" }, 404);
+    }
+
+    const startTime = Date.now();
+    const tools = getToolContracts(mode);
+    const resolvedModel = resolveChatModel(model);
+
+    // Reconstruct the full message history by merging persisted and incoming messages
+    const previousMessages = Array.isArray(session.messages)
+      ? (session.messages as unknown as NightcodeUIMessage[])
+      : [];
+    const mergedMessages = [...previousMessages];
+
+    for (const message of messages) {
+      // Stamp each incoming message with the current mode and model
+      const incomingMessage = {
+        ...message,
+        metadata: { ...message.metadata, mode, model },
+      } satisfies NightcodeUIMessage;
+
+      const existingMessageIndex = mergedMessages.findIndex(
+        (m) => m.id === incomingMessage.id,
+      );
+
+      // Insert new messages; replace existing ones (e.g. optimistic updates)
+      if (existingMessageIndex === -1) {
+        mergedMessages.push(incomingMessage);
+      } else {
+        mergedMessages[existingMessageIndex] = incomingMessage;
+      }
+    }
+
+    // Validate the final message list and convert to the format expected by the model
+    const nextMessages = await validateUIMessages<NightcodeUIMessage>({
+      messages: mergedMessages,
       tools,
+    });
+    const modelMessages = await convertToModelMessages(nextMessages, { tools });
+
+    // Captured inside `onFinish` so it is available to the streaming metadata callback
+    let completedUsage: LanguageModelUsage | null = null;
+
+    const result = streamText({
+      model: resolvedModel.model,
+      system: buildSystemPrompt({ mode }),
+      messages: modelMessages,
+      tools,
+      providerOptions: resolvedModel.providerOptions,
       onFinish(event) {
-        // Capture total token usage so it can be billed after the stream ends.
         completedUsage = event.totalUsage;
       },
     });
 
-    for await (const part of result.fullStream) {
-      // Stop processing if the client disconnected mid-stream.
-      if (stream.aborted) break;
-
-      if (part.type === "reasoning-delta") {
-        // Merge consecutive reasoning deltas into a single part.
-        const last = parts[parts.length - 1];
-        if (last && last.type === "reasoning") {
-          last.text += part.text;
-        } else {
-          parts.push({ type: "reasoning", text: part.text });
-        }
-        const event: ChatStreamEvent = {
-          type: "reasoning-delta",
-          text: part.text,
-        };
-        await stream.writeSSE({
-          event: "reasoning-delta",
-          data: JSON.stringify(event),
-        });
-      }
-
-      if (part.type === "text-delta") {
-        // Merge consecutive text deltas into a single part.
-        const last = parts[parts.length - 1];
-        if (last && last.type === "text") {
-          last.text += part.text;
-        } else {
-          parts.push({ type: "text", text: part.text });
-        }
-        const event: ChatStreamEvent = {
-          type: "text-delta",
-          text: part.text,
-        };
-        await stream.writeSSE({
-          event: "text-delta",
-          data: JSON.stringify(event),
-        });
-      }
-
-      if (part.type === "tool-call") {
-        const args = toolCallArgsSchema.parse(part.input);
-
-        Sentry.addBreadcrumb({
-          category: "tool",
-          message: `Calling tool: ${part.toolName}`,
-          level: "info",
-          data: { toolCallId: part.toolCallId, input: part.input },
-        });
-
-        parts.push({
-          type: "tool-call",
-          id: part.toolCallId,
-          name: part.toolName,
-          args,
-        });
-
-        const event: ChatStreamEvent = {
-          type: "tool-call",
-          toolCallId: part.toolCallId,
-          toolName: part.toolName,
-          args,
-        };
-
-        await stream.writeSSE({
-          event: "tool-call",
-          data: JSON.stringify(event),
-        });
-      }
-
-      if (part.type === "tool-result") {
-        const resultString =
-          typeof part.output === "string"
-            ? part.output
-            : JSON.stringify(part.output);
-
-        // Attach the result to the matching tool-call part for persistence.
-        const toolCallPart = parts.find(
-          (p): p is Extract<MessagePart, { type: "tool-call" }> =>
-            p.type === "tool-call" && p.id === part.toolCallId,
-        );
-
-        if (toolCallPart) {
-          toolCallPart.result = resultString;
+    return result.toUIMessageStreamResponse<NightcodeUIMessage>({
+      originalMessages: nextMessages,
+      /** Attaches metadata to the stream at the start and finish parts. */
+      messageMetadata({ part }) {
+        if (part.type === "start") {
+          return { mode, model };
         }
 
-        Sentry.addBreadcrumb({
-          category: "tool",
-          message: `Result for tool: ${part.toolName}`,
-          level: "info",
-          data: { toolCallId: part.toolCallId },
-        });
+        if (part.type !== "finish") return undefined;
 
-        const event: ChatStreamEvent = {
-          type: "tool-result",
-          toolCallId: part.toolCallId,
-          result: resultString,
+        return {
+          mode,
+          model,
+          durationMs: Date.now() - startTime,
+          ...(completedUsage ? { usage: completedUsage } : {}),
         };
-
-        await stream.writeSSE({
-          event: "tool-result",
-          data: JSON.stringify(event),
-        });
-      }
-
-      if (part.type === "error") {
-        throw part.error;
-      }
-    }
-
-    // Handle mid-stream aborts that broke out of the for-await loop above.
-    if (stream.aborted || abortController.signal.aborted) {
-      await persistInterruptedMessageAndUsage();
-      return;
-    }
-
-    const elapsedMs = Date.now() - startTime;
-    const fullText = parts
-      .filter((p) => p.type === "text")
-      .map((p) => p.text)
-      .join("");
-
-    const validatedParts: Prisma.InputJsonValue | undefined =
-      parts.length > 0 ? messagePartsSchema.parse(parts) : undefined;
-
-    const assistantMessage = await db.message.create({
-      data: {
-        content: fullText,
-        duration: Math.round(elapsedMs / 1000),
-        model,
-        mode,
-        parts: validatedParts,
-        role: "ASSISTANT",
-        sessionId,
-        status: MessageStatus.COMPLETE,
       },
-    });
+      async onFinish(event) {
+        // Do not persist if the stream was aborted or tool calls are still pending
+        if (event.isAborted) return;
+        if (hasPendingToolCalls(event.responseMessage)) return;
 
-    Sentry.logger.info("AI streaming completed successfully", {
-      sessionId,
-      durationMs: elapsedMs,
-    });
-
-    await ingestUsageForMessage({
-      messageId: assistantMessage.id,
-      status: "complete",
-    });
-
-    const doneEvent: ChatStreamEvent = {
-      type: "done",
-      messageId: assistantMessage.id,
-      durationMs: elapsedMs,
-    };
-
-    await stream.writeSSE({ event: "done", data: JSON.stringify(doneEvent) });
-  } catch (error) {
-    // A caught abort means the client disconnected; persist what we have and exit cleanly.
-    if (abortController.signal.aborted) {
-      Sentry.addBreadcrumb({
-        category: "chat",
-        message: "AI response aborted by signal during stream",
-        level: "info",
-      });
-      await persistInterruptedMessageAndUsage();
-      return;
-    }
-
-    const message = error instanceof Error ? error.message : String(error);
-
-    Sentry.captureException(error, {
-      tags: { "error.type": "ai_stream_failed" },
-      extra: { sessionId, model, mode },
-    });
-    Sentry.logger.error("AI stream response failed", { sessionId, message });
-
-    // Store a visible ERROR message so the UI can surface the failure.
-    await db.message.create({
-      data: {
-        content: message,
-        model,
-        mode,
-        role: "ERROR",
-        sessionId,
-        status: MessageStatus.COMPLETE,
-      },
-    });
-
-    const errorEvent: ChatStreamEvent = { type: "error", message: message };
-
-    await stream.writeSSE({ event: "error", data: JSON.stringify(errorEvent) });
-  }
-}
-
-const app = new Hono<AuthenticatedEnv>()
-  /**
-   * POST /:sessionId/resume
-   *
-   * Re-runs the AI response for a session whose last message is an
-   * unanswered USER message (e.g. after a server restart or network drop).
-   * Returns 409 if the session is already being resumed.
-   */
-  .post("/:sessionId/resume", async (c) => {
-    const sessionId = c.req.param("sessionId");
-    const userId = c.get("userId");
-
-    Sentry.setTag("session.id", sessionId);
-    Sentry.addBreadcrumb({
-      category: "chat",
-      message: "Request to resume session",
-      level: "info",
-      data: { sessionId },
-    });
-
-    const session = await db.session.findUnique({
-      where: { id: sessionId, userId },
-      include: {
-        messages: {
-          orderBy: {
-            createdAt: "asc",
+        // Persist the updated message history to the database
+        await db.session.update({
+          where: { id, userId },
+          data: {
+            messages: event.messages as unknown as Prisma.InputJsonValue,
           },
-        },
-      },
-    });
+        });
 
-    if (!session) {
-      Sentry.logger.warn("Session not found for resume", { sessionId, userId });
-      return c.json({ error: "Session not found" }, 404);
-    }
+        if (!completedUsage) return;
 
-    const resumableMessage = getResumableUserMessage(session.messages);
-    if (!resumableMessage) {
-      Sentry.logger.warn("Session has no pending user message to resume", {
-        sessionId,
-      });
-      return c.json(
-        { error: "Session has no pending user message to resume" },
-        409,
-      );
-    }
-
-    if (!isSupportedChatModel(resumableMessage.model)) {
-      Sentry.logger.warn("Session uses unsupported model for resume", {
-        sessionId,
-        model: resumableMessage.model,
-      });
-      return c.json(
-        { error: `Session uses unsupported model: ${resumableMessage.model}` },
-        409,
-      );
-    }
-
-    if (activeResumeSessionIds.has(sessionId)) {
-      Sentry.logger.warn("Session already has an active resume", { sessionId });
-      return c.json({ error: "Session already has an active resume" }, 409);
-    }
-
-    activeResumeSessionIds.add(sessionId);
-
-    const history = buildConversationHistory(session.messages);
-    const abortController = new AbortController();
-
-    try {
-      return streamSSE(
-        c,
-        async (stream) => {
-          stream.onAbort(() => {
-            abortController.abort();
+        // Report token usage to Polar for credit billing
+        try {
+          const billableUsage = calculateCreditsForUsage({
+            provider: resolvedModel.provider,
+            model: resolvedModel.modelId,
+            usage: completedUsage,
           });
 
-          try {
-            await streamAIResponse(stream, {
-              abortController,
-              cwd: session.cwd,
-              history,
-              mode: resumableMessage.mode,
-              model: resumableMessage.model,
-              sessionId,
-              userId,
-            });
-          } finally {
-            // Always release the lock so a future resume can proceed.
-            activeResumeSessionIds.delete(sessionId);
-          }
-        },
-        async (err, stream) => {
-          // SSE-level error handler: fires when the stream itself throws unexpectedly.
-          activeResumeSessionIds.delete(sessionId);
-          Sentry.captureException(err, {
-            tags: {
-              "error.type": "sse_stream_error",
-              "sse.operation": "resume",
-            },
-            extra: { sessionId },
+          await ingestAiUsage({
+            externalCustomerId: userId,
+            eventId: `chat-message:${event.responseMessage.id}`,
+            credits: billableUsage.credits,
           });
-          const message = err instanceof Error ? err.message : String(err);
-          Sentry.logger.error("SSE stream resume error callback triggered", {
-            sessionId,
-            message,
-          });
-          const errorEvent: ChatStreamEvent = {
-            type: "error",
-            message: message,
-          };
-
-          await stream.writeSSE({
-            event: "error",
-            data: JSON.stringify(errorEvent),
-          });
-        },
-      );
-    } catch (error) {
-      // Catches synchronous throws from streamSSE setup itself.
-      activeResumeSessionIds.delete(sessionId);
-      Sentry.captureException(error, {
-        tags: { "error.type": "resume_route_failed" },
-        extra: { sessionId },
-      });
-      Sentry.logger.error("Resume route handler threw exception", {
-        sessionId,
-        message: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
-  })
-  /**
-   * POST /:sessionId
-   *
-   * Accepts a new user message, persists it, then streams the AI
-   * response back over SSE. Validated by `submitValidator`.
-   */
-  .post("/:sessionId", requireCreditsBalance, submitValidator, async (c) => {
-    const sessionId = c.req.param("sessionId");
-    const userId = c.get("userId");
-
-    Sentry.setTag("session.id", sessionId);
-    Sentry.addBreadcrumb({
-      category: "chat",
-      message: "Request to submit chat message",
-      level: "info",
-      data: { sessionId },
-    });
-
-    const session = await db.session.findUnique({
-      where: { id: sessionId, userId },
-      include: {
-        messages: {
-          orderBy: {
-            createdAt: "asc",
-          },
-        },
-      },
-    });
-
-    if (!session) {
-      Sentry.logger.warn("Session not found for submission", {
-        sessionId,
-        userId,
-      });
-      return c.json({ error: "Session not found" }, 404);
-    }
-
-    const data = c.req.valid("json");
-
-    await db.message.create({
-      data: {
-        sessionId,
-        role: "USER",
-        status: MessageStatus.COMPLETE,
-        model: data.model,
-        content: data.content,
-        mode: data.mode,
-      },
-    });
-
-    // Include the new user message in history before streaming.
-    const history = buildConversationHistory([
-      ...session.messages,
-      { role: "USER", content: data.content, status: MessageStatus.COMPLETE },
-    ]);
-
-    const abortController = new AbortController();
-
-    try {
-      return streamSSE(
-        c,
-        async (stream) => {
-          stream.onAbort(() => {
-            abortController.abort();
-          });
-
-          await streamAIResponse(stream, {
-            abortController,
-            cwd: session.cwd,
-            history,
-            mode: data.mode,
-            model: data.model,
-            sessionId,
+        } catch (error) {
+          console.error("Failed to ingest Polar AI usage for chat message", {
+            error,
+            sessionId: id,
+            messageId: event.responseMessage.id,
             userId,
           });
-        },
-        async (err, stream) => {
-          // SSE-level error handler: fires when the stream itself throws unexpectedly.
-          Sentry.captureException(err, {
-            tags: {
-              "error.type": "sse_stream_error",
-              "sse.operation": "submit",
-            },
-            extra: { sessionId },
-          });
-          const message = err instanceof Error ? err.message : String(err);
-          Sentry.logger.error("SSE stream submit error callback triggered", {
-            sessionId,
-            message,
-          });
-          const errorEvent: ChatStreamEvent = {
-            type: "error",
-            message: message,
-          };
-
-          await stream.writeSSE({
-            event: "error",
-            data: JSON.stringify(errorEvent),
-          });
-        },
-      );
-    } catch (error) {
-      // Catches synchronous throws from streamSSE setup itself.
-      Sentry.captureException(error, {
-        tags: { "error.type": "submit_route_failed" },
-        extra: { sessionId },
-      });
-      Sentry.logger.error("Submit route handler threw exception", {
-        sessionId,
-        message: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
-    }
-  });
+        }
+      },
+      onError(error) {
+        return error instanceof Error ? error.message : String(error);
+      },
+    });
+  },
+);
 
 export default app;

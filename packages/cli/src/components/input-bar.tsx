@@ -8,7 +8,7 @@
  * - Mode toggling between BUILD and PLAN modes
  */
 
-import { Mode } from "@nightcode/database/enums";
+import { Mode } from "@nightcode/shared";
 import {
   ScrollBoxRenderable,
   TextAttributes,

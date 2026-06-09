@@ -1,4 +1,4 @@
-import { Mode } from "@nightcode/database/enums";
+import { Mode } from "@nightcode/shared";
 import { TextAttributes } from "@opentui/core";
 import { usePromptConfig } from "../providers/prompt-config";
 import { useTheme } from "../providers/theme";
