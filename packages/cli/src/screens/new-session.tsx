@@ -1,4 +1,4 @@
-import { Mode } from "@nightcode/database/enums";
+import { modeSchema } from "@nightcode/shared";
 import { useEffect, useMemo, useRef } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { z } from "zod";
@@ -10,7 +10,7 @@ import { useToast } from "../providers/toast";
 
 const newSessionStateSchema = z.object({
   message: z.string(),
-  mode: z.enum(Mode),
+  mode: modeSchema,
   model: z.string(),
 });
 
@@ -22,7 +22,6 @@ export function NewSession() {
 
   const state = useMemo(() => {
     const parsed = newSessionStateSchema.safeParse(location.state);
-
     return parsed.success ? parsed.data : null;
   }, [location.state]);
 
@@ -31,9 +30,9 @@ export function NewSession() {
     if (!state) {
       navigate("/", { replace: true });
     }
-  }, [navigate, state]);
+  }, [state, navigate]);
 
-  // Create the session on mount - this screen exists to do this only
+  // Create the session on mount — this screen exists to do this
   useEffect(() => {
     if (!state || hasStartedRef.current) return;
 
@@ -45,13 +44,6 @@ export function NewSession() {
         const res = await apiClient.sessions.$post({
           json: {
             title: state.message.slice(0, 100),
-            cwd: process.cwd(),
-            initialMessage: {
-              content: state.message,
-              mode: state.mode,
-              model: state.model,
-              role: "USER",
-            },
           },
         });
 
@@ -59,11 +51,10 @@ export function NewSession() {
         if (!res.ok) {
           throw new Error(await getErrorMessage(res));
         }
-
         const session = await res.json();
         navigate(`/sessions/${session.id}`, {
           replace: true,
-          state: { session },
+          state: { session, initialPrompt: state },
         });
       } catch (error) {
         if (ignore) return;
@@ -77,7 +68,6 @@ export function NewSession() {
     };
 
     createSession();
-
     return () => {
       ignore = true;
     };

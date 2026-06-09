@@ -1,15 +1,16 @@
-import { Mode } from "@nightcode/database/enums";
 import {
   DEFAULT_CHAT_MODEL_ID,
+  Mode,
+  type ModeType,
   type SupportedChatModelId,
 } from "@nightcode/shared";
 import type { ReactNode } from "react";
 import { createContext, useCallback, useContext, useState } from "react";
 
 type PromptConfigContextValue = {
-  mode: Mode;
+  mode: ModeType;
   toggleMode: () => void;
-  setMode: (mode: Mode) => void;
+  setMode: (mode: ModeType) => void;
   model: SupportedChatModelId;
   setModel: (model: SupportedChatModelId) => void;
 };
@@ -33,7 +34,7 @@ type PromptConfigProviderProps = {
 };
 
 export function PromptConfigProvider({ children }: PromptConfigProviderProps) {
-  const [mode, setMode] = useState<Mode>(Mode.BUILD);
+  const [mode, setMode] = useState<ModeType>(Mode.BUILD);
   const [model, setModel] = useState<SupportedChatModelId>(
     DEFAULT_CHAT_MODEL_ID,
   );
